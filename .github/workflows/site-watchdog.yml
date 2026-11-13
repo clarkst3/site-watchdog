@@ -8,7 +8,7 @@ name: WEBSITE DOWN ALARM (tscpatax.com)
 # If minutes matter, add a paid uptime monitor on top of this.
 on:
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '3-59/10 * * * *'
   workflow_dispatch:
     inputs:
       test_alarm:

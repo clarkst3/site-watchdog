@@ -1,0 +1,68 @@
+name: WEBSITE DOWN ALARM (tscpatax.com)
+
+# Outside watchdog for the live domain. A red run means real visitors cannot
+# reach the site, the contact form or the upload portal, and GitHub emails the
+# failure to the account owner.
+#
+# ponytail: GitHub cron can run several minutes late and cannot page a phone.
+# If minutes matter, add a paid uptime monitor on top of this.
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      # GitHub switches off cron in a public repo after 60 quiet days.
+      # Re-enabling the workflow on every run keeps the timer fresh.
+      - name: Keep the schedule alive
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/site-watchdog.yml/enable"
+      - name: Site, certificate, DNS and form routes
+        run: |
+          check() {
+            fail=0
+            say() { echo "FAIL: $1"; fail=1; }
+
+            # Pages: valid certificate (curl verifies it), 200, served by Vercel.
+            for path in / /upload /contact; do
+              out=$(curl -sS -I --max-time 20 "https://tscpatax.com$path" 2>&1) || { say "$path unreachable or bad certificate: $out"; continue; }
+              echo "$out" | head -1 | grep -q ' 200' || say "$path status: $(echo "$out" | head -1)"
+              echo "$out" | grep -qi '^server: vercel' || say "$path is not served by Vercel: $(echo "$out" | grep -i '^server:')"
+            done
+
+            # www must redirect to the apex over a valid certificate.
+            loc=$(curl -sS -o /dev/null --max-time 20 -w '%{http_code} %{redirect_url}' https://www.tscpatax.com/ 2>&1) || say "www unreachable or bad certificate: $loc"
+            case "$loc" in 30?\ https://tscpatax.com/*) ;; *) say "www redirect: $loc" ;; esac
+
+            # API routes alive (GET is refused on purpose, 404 would mean the wrong host).
+            for api in /api/contact /api/upload; do
+              code=$(curl -sS -o /dev/null --max-time 20 -w '%{http_code}' "https://tscpatax.com$api" 2>&1)
+              [ "$code" = "405" ] || say "$api returned $code, expected 405"
+            done
+
+            # No IPv6 record: Vercel has none, so any AAAA is another host taking the domain.
+            aaaa=$(curl -sS --max-time 20 'https://dns.google/resolve?name=tscpatax.com&type=AAAA' 2>&1)
+            echo "$aaaa" | grep -q '"Answer"' && say "tscpatax.com has an AAAA record: $aaaa"
+
+            # Certificate must have more than 7 days left (catches a failed renewal).
+            echo | openssl s_client -connect tscpatax.com:443 -servername tscpatax.com 2>/dev/null \
+              | openssl x509 -noout -checkend 604800 >/dev/null || say "certificate expires within 7 days"
+
+            return $fail
+          }
+
+          # Three tries, 30 s apart, so one network blip never raises the alarm.
+          for try in 1 2 3; do
+            if check; then echo "OK on try $try"; exit 0; fi
+            [ "$try" = 3 ] || sleep 30
+          done
+          echo "::error::tscpatax.com failed 3 checks in a row. Check the domain DNS records first."
+          exit 1

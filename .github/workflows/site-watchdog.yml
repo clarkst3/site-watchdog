@@ -4,8 +4,12 @@ name: WEBSITE DOWN ALARM (tscpatax.com)
 # reach the site, the contact form or the upload portal, and GitHub emails the
 # failure to the account owner.
 #
-# ponytail: GitHub cron can run several minutes late and cannot page a phone.
-# If minutes matter, add a paid uptime monitor on top of this.
+# GitHub cron on this repo fired about once in 8 hours, so cron alone is not a
+# watchdog. A "chain" run checks every 10 minutes for about 5.5 hours, then
+# starts the next chain run itself (workflow_dispatch from GITHUB_TOKEN is
+# allowed to start a run). Cron stays as the backup that restarts a broken chain.
+# ponytail: one idle runner per chain; if GitHub ever objects, move to an
+# uptime monitor service.
 on:
   schedule:
     - cron: '3-59/10 * * * *'
@@ -15,11 +19,19 @@ on:
         description: 'Fail on purpose to prove the alarm email arrives'
         type: boolean
         default: false
+      chain:
+        description: 'Loop checks for 5.5 hours, then start the next chain run'
+        type: boolean
+        default: false
+      wait_first:
+        description: 'Wait 15 minutes before the first check (set after an alarm)'
+        type: boolean
+        default: false
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 355
     permissions:
       actions: write
     steps:
@@ -35,6 +47,10 @@ jobs:
         run: echo "::error::ALARM TEST ONLY. The site is fine."; exit 1
 
       - name: Site, certificate, DNS and form routes
+        id: watch
+        env:
+          CHAIN: ${{ inputs.chain }}
+          WAIT_FIRST: ${{ inputs.wait_first }}
         run: |
           check() {
             fail=0
@@ -69,9 +85,41 @@ jobs:
           }
 
           # Three tries, 30 s apart, so one network blip never raises the alarm.
-          for try in 1 2 3; do
-            if check; then echo "OK on try $try"; exit 0; fi
-            [ "$try" = 3 ] || sleep 30
+          round() {
+            for try in 1 2 3; do
+              if check; then echo "OK on try $try at $(date -u +%H:%M)Z"; return 0; fi
+              [ "$try" = 3 ] || sleep 30
+            done
+            echo "::error::tscpatax.com failed 3 checks in a row. Check the domain DNS records first."
+            exit 1
+          }
+
+          # After an alarm, wait before checking again so an outage sends one
+          # email about every 20 minutes, not one every 2 minutes.
+          [ "$WAIT_FIRST" = true ] && sleep 900
+
+          if [ "$CHAIN" != true ]; then round; exit 0; fi
+          end=$(( $(date +%s) + 330*60 ))
+          while :; do
+            round
+            [ "$(date +%s)" -lt "$end" ] || exit 0
+            sleep 600
           done
-          echo "::error::tscpatax.com failed 3 checks in a row. Check the domain DNS records first."
-          exit 1
+
+      # Chain runs start the next chain run, even after an alarm.
+      - name: Start the next chain run
+        if: ${{ always() && inputs.chain }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FAILED: ${{ steps.watch.outcome == 'failure' }}
+        run: gh workflow run site-watchdog.yml -R "$GITHUB_REPOSITORY" -f chain=true -f wait_first="$FAILED"
+
+      # Cron runs restart the chain if no chain run is going.
+      - name: Restart the chain if it stopped
+        if: ${{ always() && github.event_name == 'schedule' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          live=$(gh run list -R "$GITHUB_REPOSITORY" -w site-watchdog.yml -e workflow_dispatch -L 20             --json status --jq '[.[] | select(.status != "completed")] | length')
+          [ "$live" -gt 0 ] && { echo "Chain is running ($live)"; exit 0; }
+          gh workflow run site-watchdog.yml -R "$GITHUB_REPOSITORY" -f chain=true

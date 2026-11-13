@@ -10,6 +10,11 @@ on:
   schedule:
     - cron: '*/10 * * * *'
   workflow_dispatch:
+    inputs:
+      test_alarm:
+        description: 'Fail on purpose to prove the alarm email arrives'
+        type: boolean
+        default: false
 
 jobs:
   check:
@@ -25,6 +30,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/site-watchdog.yml/enable"
+      - name: Alarm test (manual runs only)
+        if: ${{ inputs.test_alarm }}
+        run: echo "::error::ALARM TEST ONLY. The site is fine."; exit 1
+
       - name: Site, certificate, DNS and form routes
         run: |
           check() {
